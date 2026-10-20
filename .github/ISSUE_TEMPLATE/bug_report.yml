@@ -1,0 +1,52 @@
+name: 问题报告
+description: 报告可复现的程序问题
+title: "[问题] "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 清楚、简洁地描述遇到的问题。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 提供触发问题的命令和操作步骤。
+      placeholder: |
+        1. 运行 ...
+        2. 观察 ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+      description: 描述你期望发生什么。
+    validations:
+      required: true
+  - type: input
+    id: zig-version
+    attributes:
+      label: Zig 版本
+      placeholder: "zig version 的输出"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统
+      placeholder: Windows / Linux / macOS 及版本
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: 如有相关错误输出，请粘贴在此处。请先移除账户凭据、令牌及其他敏感信息。
+      render: text
+    validations:
+      required: false
