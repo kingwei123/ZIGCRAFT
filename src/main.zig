@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const json = std.json;
 const Sha1 = std.crypto.hash.Sha1;
 const Md5 = std.crypto.hash.Md5;
@@ -14,6 +15,7 @@ const ModrinthDownloadParallelism = 8;
 const MaxPackEntries: u64 = 100_000;
 const MaxPackUncompressedBytes: u64 = 16 * 1024 * 1024 * 1024;
 const DefaultNeoForgeMavenUrl = "https://neoforged.forgecdn.net/releases";
+const OfficialForgeMavenUrl = "https://maven.minecraftforge.net";
 const DownloadUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 const ModLoader = enum {
@@ -159,13 +161,17 @@ pub fn main(init: process.Init) !void {
         return error.UnsupportedForgeVersion;
     }
     if (loader == .neoforge and !isNeoForgeMinecraftSupported(version_id)) {
-        std.debug.print("NeoForge 启动目前支持 Minecraft 1.20.1 及以上版本。\n", .{});
+        std.debug.print("NeoForge 支持 Minecraft 1.20.1 及以上的正式版本（以官方 Maven 元数据中可用的版本为准）。\n", .{});
         return error.UnsupportedNeoForgeVersion;
     }
     if (requested_loader_version) |loader_version| {
         if (!isValidForgeVersion(loader_version)) {
             std.debug.print("加载器版本只能包含数字、字母、点和连字符。\n", .{});
             return error.InvalidForgeVersion;
+        }
+        if (loader == .neoforge and !neoForgeVersionMatchesMinecraft(loader_version, version_id)) {
+            std.debug.print("指定的 NeoForge 版本 {s} 与 Minecraft {s} 不匹配。\n", .{ loader_version, version_id });
+            return error.IncompatibleNeoForgeVersion;
         }
     }
     const player_uuid = try offlineUuid(allocator, player_name);
@@ -229,7 +235,23 @@ pub fn main(init: process.Init) !void {
 
     // 6. 启动游戏
     std.debug.print("\n[启动] 正在构建 JVM 参数并启动游戏...\n", .{});
-    try launchGame(allocator, io, version_id, instance_dir, player_name, player_uuid, version_json.value, if (loader_json) |profile| profile.value else null);
+    const java_home = init.environ_map.get("MC_JAVA_HOME") orelse init.environ_map.get("JAVA_HOME");
+    const java_executable = if (java_home) |home|
+        try path.join(allocator, &.{ home, "bin", if (builtin.os.tag == .windows) "java.exe" else "java" })
+    else
+        try allocator.dupe(u8, "java");
+    defer allocator.free(java_executable);
+    try launchGame(
+        allocator,
+        io,
+        version_id,
+        instance_dir,
+        player_name,
+        player_uuid,
+        version_json.value,
+        if (loader_json) |profile| profile.value else null,
+        java_executable,
+    );
 }
 
 fn useExistingMinecraftDirectory(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -285,7 +307,7 @@ fn printUsage(executable: []const u8) void {
         \\每个版本的数据保存在 .minecraft/instances/<版本ID> 中。
         \\mod 存放在各加载器实例独立的 mods 目录中。
         \\Forge 支持范围: Minecraft 1.13+（仅限 Forge 官方发布的版本）
-        \\NeoForge 支持范围: Minecraft 1.20.1+
+        \\NeoForge 支持范围: Minecraft 1.20.1+（自动匹配官方 Maven 元数据中的可用版本）
         \\Fabric 支持 Fabric Loader 官方元数据提供的 Minecraft 版本。
         \\整合包支持 .zip 目录包及 CurseForge、MultiMC、Modrinth 清单。
         \\示例: {s} 1.20.1 Steve --neoforge 21.1.172
@@ -827,7 +849,7 @@ fn importModpack(
         return error.UnsupportedForgeVersion;
     }
     if (selected_loader == .neoforge and !isNeoForgeMinecraftSupported(minecraft_version)) {
-        std.debug.print("NeoForge 整合包目前要求 Minecraft 1.20.1 或更高版本。\n", .{});
+        std.debug.print("NeoForge 整合包要求 Minecraft 1.20.1 或更高的正式版本。\n", .{});
         return error.UnsupportedNeoForgeVersion;
     }
     if (requested_loader) |requested| {
@@ -856,6 +878,15 @@ fn importModpack(
         };
     } else null;
     defer if (loader_version) |version| allocator.free(version);
+    if (selected_loader == .neoforge and
+        !neoForgeVersionMatchesMinecraft(loader_version.?, minecraft_version))
+    {
+        std.debug.print(
+            "指定的 NeoForge 版本 {s} 与整合包 Minecraft {s} 不匹配。\n",
+            .{ loader_version.?, minecraft_version },
+        );
+        return error.IncompatibleNeoForgeVersion;
+    }
     const instance_id = try makeLoaderInstanceId(allocator, minecraft_version, selected_loader, loader_version);
     defer allocator.free(instance_id);
     const instance_path = try path.join(allocator, &.{ instances_path, instance_id });
@@ -1049,17 +1080,31 @@ fn isForgeMinecraftSupported(version_id: []const u8) bool {
     return major > 1 or (major == 1 and minor >= 13);
 }
 
-fn isNeoForgeMinecraftSupported(version_id: []const u8) bool {
+const MinecraftReleaseVersion = struct {
+    major: u32,
+    minor: u32,
+    patch: u32,
+};
+
+fn parseMinecraftReleaseVersion(version_id: []const u8) ?MinecraftReleaseVersion {
     var parts = std.mem.splitScalar(u8, version_id, '.');
-    const major_text = parts.next() orelse return false;
-    const minor_text = parts.next() orelse return false;
-    const major = std.fmt.parseInt(u32, major_text, 10) catch return false;
-    const minor = std.fmt.parseInt(u32, minor_text, 10) catch return false;
-    if (major != 1) return major > 1;
-    if (minor != 20) return minor > 20;
-    const patch_text = parts.next() orelse return false;
-    const patch = std.fmt.parseInt(u32, patch_text, 10) catch return false;
-    return patch >= 1;
+    const major_text = parts.next() orelse return null;
+    const minor_text = parts.next() orelse return null;
+    const major = std.fmt.parseInt(u32, major_text, 10) catch return null;
+    const minor = std.fmt.parseInt(u32, minor_text, 10) catch return null;
+    const patch = if (parts.next()) |patch_text|
+        std.fmt.parseInt(u32, patch_text, 10) catch return null
+    else
+        0;
+    if (parts.next() != null or major == 0) return null;
+    return .{ .major = major, .minor = minor, .patch = patch };
+}
+
+fn isNeoForgeMinecraftSupported(version_id: []const u8) bool {
+    const version = parseMinecraftReleaseVersion(version_id) orelse return false;
+    if (version.major != 1) return version.major > 1;
+    if (version.minor != 20) return version.minor > 20;
+    return version.patch >= 1;
 }
 
 fn makeInstanceId(allocator: std.mem.Allocator, version_id: []const u8, forge_version: ?[]const u8) ![]u8 {
@@ -1170,7 +1215,30 @@ fn replaceInPlace(allocator: std.mem.Allocator, value: *[]u8, needle: []const u8
 
 /// 使用系统 curl 下载文件内容 (解决 Zig std http 不支持 HTTPS 的问题)
 fn fetchUrl(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
-    const argv = [_][]const u8{
+    return try fetchUrlWithRetryOptions(allocator, io, url, "8", "300");
+}
+
+fn fetchUrlWithRetryOptions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    retry_count: []const u8,
+    retry_max_time: []const u8,
+) ![]u8 {
+    return fetchUrlWithRevocationFallback(allocator, io, url, retry_count, retry_max_time, false);
+}
+
+fn fetchUrlWithRevocationFallback(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    retry_count: []const u8,
+    retry_max_time: []const u8,
+    skip_revocation_check: bool,
+) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{
         "curl",
         "--http1.1",
         "--user-agent",
@@ -1180,26 +1248,45 @@ fn fetchUrl(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
         "--show-error",
         "--location",
         "--retry",
-        "8",
+        retry_count,
         "--retry-all-errors",
         "--retry-delay",
         "2",
         "--retry-max-time",
-        "300",
+        retry_max_time,
         "--connect-timeout",
         "20",
         "--max-time",
         "300",
-        url,
-    };
-    const result = try process.run(allocator, io, .{
-        .argv = &argv,
+    });
+    if (skip_revocation_check) try argv.append(allocator, "--ssl-no-revoke");
+    try argv.append(allocator, url);
+
+    const result = process.run(allocator, io, .{
+        .argv = argv.items,
         .stdout_limit = .limited(200 * 1024 * 1024),
         .stderr_limit = .limited(1024 * 1024),
-    });
+    }) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("未找到 curl。请安装 curl 后重试（Debian/Ubuntu: sudo apt install curl）。\n", .{});
+            return error.CurlNotFound;
+        }
+        return err;
+    };
 
     switch (result.term) {
         .exited => |code| if (code != 0) {
+            if (!skip_revocation_check and builtin.os.tag == .windows and
+                std.mem.indexOf(u8, result.stderr, "CRYPT_E_REVOCATION_OFFLINE") != null)
+            {
+                allocator.free(result.stdout);
+                allocator.free(result.stderr);
+                std.debug.print(
+                    "Windows 无法连接证书吊销检查服务器；将保留 TLS 证书验证并重试下载: {s}\n",
+                    .{url},
+                );
+                return fetchUrlWithRevocationFallback(allocator, io, url, retry_count, retry_max_time, true);
+            }
             allocator.free(result.stdout);
             std.debug.print("curl 下载失败: {s} (exit code {}): {s}\n", .{ url, code, result.stderr });
             allocator.free(result.stderr);
@@ -1215,6 +1302,17 @@ fn fetchUrl(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
 
     allocator.free(result.stderr);
     return result.stdout;
+}
+
+fn fetchForgeInstaller(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
+    const data = fetchUrlWithRetryOptions(allocator, io, url, "2", "120") catch |err| {
+        std.debug.print("Forge 安装器下载失败: {s} ({s})\n", .{ url, @errorName(err) });
+        return error.ForgeInstallerDownloadFailed;
+    };
+    if (isZipHeader(data)) return data;
+    std.debug.print("Forge 安装器下载源返回的文件不是有效 JAR: {s}\n", .{url});
+    allocator.free(data);
+    return error.ForgeInstallerDownloadFailed;
 }
 
 fn fetchVersionJson(allocator: std.mem.Allocator, io: std.Io, version_id: []const u8) !json.Parsed(json.Value) {
@@ -1235,13 +1333,50 @@ fn fetchVersionJson(allocator: std.mem.Allocator, io: std.Io, version_id: []cons
         }
     }
 
-    const v_url = version_url orelse return error.VersionNotFound;
+    const v_url = version_url orelse {
+        if (findPreviewVersionId(versions.items, version_id)) |preview_id| {
+            std.debug.print(
+                "Mojang 版本清单中没有 Minecraft {s}。找到相关预览版本 {s}；如需使用，请提供完整版本 ID。加载器可能不支持预览版本。\n",
+                .{ version_id, preview_id },
+            );
+        } else {
+            std.debug.print(
+                "Mojang 版本清单中没有 Minecraft {s}。请检查版本 ID；版本必须与官方清单中的 ID 完全一致。\n",
+                .{version_id},
+            );
+        }
+        return error.VersionNotFound;
+    };
 
     // 获取具体版本 JSON
     const version_str = try fetchUrl(allocator, io, v_url);
     defer allocator.free(version_str);
 
     return try json.parseFromSlice(json.Value, allocator, version_str, .{});
+}
+
+fn findPreviewVersionId(versions: []const json.Value, requested_id: []const u8) ?[]const u8 {
+    for (versions) |version| {
+        if (version != .object) continue;
+        const id_value = version.object.get("id") orelse continue;
+        if (id_value != .string) continue;
+        const id = id_value.string;
+        if (id.len <= requested_id.len or
+            !std.mem.startsWith(u8, id, requested_id) or
+            id[requested_id.len] != '-')
+        {
+            continue;
+        }
+
+        const suffix = id[requested_id.len..];
+        if (std.mem.startsWith(u8, suffix, "-snapshot-") or
+            std.mem.startsWith(u8, suffix, "-pre-") or
+            std.mem.startsWith(u8, suffix, "-rc-"))
+        {
+            return id;
+        }
+    }
+    return null;
 }
 
 fn fetchRecommendedForgeVersion(allocator: std.mem.Allocator, io: std.Io, minecraft_version: []const u8) ![]u8 {
@@ -1355,20 +1490,37 @@ fn neoForgeVersionMatchesMinecraft(version: []const u8, minecraft_version: []con
         return true;
     }
 
-    var parts = std.mem.splitScalar(u8, minecraft_version, '.');
-    const major_text = parts.next() orelse return false;
-    const minor_text = parts.next() orelse return false;
-    const major = std.fmt.parseInt(u32, major_text, 10) catch return false;
-    const minor = std.fmt.parseInt(u32, minor_text, 10) catch return false;
-    const patch = if (parts.next()) |patch_text|
-        std.fmt.parseInt(u32, patch_text, 10) catch return false
-    else
-        0;
-    const neo_major = if (major == 1) minor else major;
-    const neo_minor = if (major == 1) patch else minor;
+    const minecraft = parseMinecraftReleaseVersion(minecraft_version) orelse return false;
+    const neo_major = if (minecraft.major == 1) minecraft.minor else minecraft.major;
+    const neo_minor = if (minecraft.major == 1) minecraft.patch else minecraft.minor;
     var prefix_buffer: [32]u8 = undefined;
     const prefix = std.fmt.bufPrint(&prefix_buffer, "{d}.{d}.", .{ neo_major, neo_minor }) catch return false;
     return std.mem.startsWith(u8, version, prefix);
+}
+
+fn neoForgeMavenArtifactName(minecraft_version: []const u8) []const u8 {
+    return if (std.mem.eql(u8, minecraft_version, "1.20.1")) "forge" else "neoforge";
+}
+
+fn neoForgeMavenMetadataPath(allocator: std.mem.Allocator, minecraft_version: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "net/neoforged/{s}/maven-metadata.xml",
+        .{neoForgeMavenArtifactName(minecraft_version)},
+    );
+}
+
+fn neoForgeInstallerRelativePath(
+    allocator: std.mem.Allocator,
+    minecraft_version: []const u8,
+    neoforge_version: []const u8,
+) ![]u8 {
+    const artifact_name = neoForgeMavenArtifactName(minecraft_version);
+    return std.fmt.allocPrint(
+        allocator,
+        "net/neoforged/{s}/{s}/{s}-{s}-installer.jar",
+        .{ artifact_name, neoforge_version, artifact_name, neoforge_version },
+    );
 }
 
 fn selectNeoForgeVersion(allocator: std.mem.Allocator, metadata_xml: []const u8, minecraft_version: []const u8) ![]u8 {
@@ -1395,10 +1547,12 @@ fn fetchRecommendedNeoForgeVersion(
     minecraft_version: []const u8,
     maven_base_url: []const u8,
 ) ![]u8 {
+    const metadata_path = try neoForgeMavenMetadataPath(allocator, minecraft_version);
+    defer allocator.free(metadata_path);
     const metadata_url = try neoForgeArtifactUrl(
         allocator,
         maven_base_url,
-        "net/neoforged/neoforge/maven-metadata.xml",
+        metadata_path,
     );
     defer allocator.free(metadata_url);
     const metadata_xml = try fetchUrl(allocator, io, metadata_url);
@@ -1419,15 +1573,22 @@ fn neoForgeArtifactUrl(allocator: std.mem.Allocator, base_url: []const u8, artif
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimmed_base, artifact_path });
 }
 
-fn installForge(allocator: std.mem.Allocator, io: std.Io, minecraft_version: []const u8, forge_version: []const u8) !json.Parsed(json.Value) {
+fn installForge(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    minecraft_version: []const u8,
+    forge_version: []const u8,
+) !json.Parsed(json.Value) {
     const forge_coordinate = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ minecraft_version, forge_version });
     defer allocator.free(forge_coordinate);
     const installer_name = try std.fmt.allocPrint(allocator, "forge-{s}-installer.jar", .{forge_coordinate});
     defer allocator.free(installer_name);
     const installer_path = try path.join(allocator, &.{ McDir, installer_name });
     defer allocator.free(installer_path);
-    const installer_url = try std.fmt.allocPrint(allocator, "https://maven.minecraftforge.net/net/minecraftforge/forge/{s}/forge-{s}-installer.jar", .{ forge_coordinate, forge_coordinate });
-    defer allocator.free(installer_url);
+    const installer_relative_path = try std.fmt.allocPrint(allocator, "net/minecraftforge/forge/{s}/forge-{s}-installer.jar", .{ forge_coordinate, forge_coordinate });
+    defer allocator.free(installer_relative_path);
+    const official_installer_url = try forgeInstallerUrl(allocator, installer_relative_path);
+    defer allocator.free(official_installer_url);
     const profile_id = try std.fmt.allocPrint(allocator, "{s}-forge-{s}", .{ minecraft_version, forge_version });
     defer allocator.free(profile_id);
     const profile_filename = try std.fmt.allocPrint(allocator, "{s}.json", .{profile_id});
@@ -1443,14 +1604,14 @@ fn installForge(allocator: std.mem.Allocator, io: std.Io, minecraft_version: []c
         const profile_text = try fs.cwd().readFileAlloc(io, profile_path, allocator, .limited(16 * 1024 * 1024));
         defer allocator.free(profile_text);
         const cached_profile = try json.parseFromSlice(json.Value, allocator, profile_text, .{});
-        if (try forgeArtifactsExist(allocator, io, minecraft_version, forge_version, cached_profile.value)) {
+        if (try forgeClientArtifactExists(allocator, io, minecraft_version, forge_version, cached_profile.value)) {
             return cached_profile;
         }
         cached_profile.deinit();
-        std.debug.print("Forge profile 存在但客户端产物缺失，将重新运行安装器。\n", .{});
+        std.debug.print("Forge profile 无效或客户端 JAR 缺失，将重新运行安装器。\n", .{});
     } else |_| {}
 
-    const installer_data = try fetchUrl(allocator, io, installer_url);
+    const installer_data = try fetchForgeInstaller(allocator, io, official_installer_url);
     defer allocator.free(installer_data);
     const installer_file = try fs.cwd().createFile(io, installer_path, .{});
     defer installer_file.close(io);
@@ -1486,9 +1647,12 @@ fn installForge(allocator: std.mem.Allocator, io: std.Io, minecraft_version: []c
     const profile_text = try fs.cwd().readFileAlloc(io, profile_path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(profile_text);
     const profile = try json.parseFromSlice(json.Value, allocator, profile_text, .{});
-    if (!try forgeArtifactsExist(allocator, io, minecraft_version, forge_version, profile.value)) {
+    if (!try forgeClientArtifactExists(allocator, io, minecraft_version, forge_version, profile.value)) {
         profile.deinit();
-        std.debug.print("Forge 安装器未生成完整客户端文件，请检查网络连接及安装器日志。\n", .{});
+        std.debug.print(
+            "Forge 安装器退出成功，但 profile 无效或客户端 JAR 缺失。下载源: {s}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ OfficialForgeMavenUrl, result.stdout, result.stderr },
+        );
         return error.ForgeInstallIncomplete;
     }
     return profile;
@@ -1538,6 +1702,28 @@ fn neoForgeMappingsVersion(profile: json.Value) ?[]const u8 {
     return null;
 }
 
+fn neoForgeProfileId(allocator: std.mem.Allocator, minecraft_version: []const u8, neoforge_version: []const u8) ![]u8 {
+    if (std.mem.eql(u8, minecraft_version, "1.20.1")) {
+        const legacy_prefix = "1.20.1-";
+        if (!std.mem.startsWith(u8, neoforge_version, legacy_prefix)) return error.IncompatibleNeoForgeVersion;
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}-forge-{s}",
+            .{ minecraft_version, neoforge_version[legacy_prefix.len..] },
+        );
+    }
+    return std.fmt.allocPrint(allocator, "neoforge-{s}", .{neoforge_version});
+}
+
+fn neoForgeClientArtifactPath(allocator: std.mem.Allocator, minecraft_version: []const u8, neoforge_version: []const u8) ![]u8 {
+    const artifact_name = neoForgeMavenArtifactName(minecraft_version);
+    const client_jar_name = try std.fmt.allocPrint(allocator, "{s}-{s}-client.jar", .{ artifact_name, neoforge_version });
+    defer allocator.free(client_jar_name);
+    return path.join(allocator, &.{
+        McDir, "libraries", "net", "neoforged", artifact_name, neoforge_version, client_jar_name,
+    });
+}
+
 fn neoForgeArtifactsExist(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1545,6 +1731,12 @@ fn neoForgeArtifactsExist(
     neoforge_version: []const u8,
     profile: json.Value,
 ) !bool {
+    if (std.mem.eql(u8, minecraft_version, "1.20.1")) {
+        const client_jar_path = try neoForgeClientArtifactPath(allocator, minecraft_version, neoforge_version);
+        defer allocator.free(client_jar_path);
+        return try isZipFile(io, client_jar_path);
+    }
+
     const mappings_version = neoForgeMappingsVersion(profile) orelse return false;
     const minecraft_coordinate = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ minecraft_version, mappings_version });
     defer allocator.free(minecraft_coordinate);
@@ -1574,13 +1766,62 @@ fn neoForgeArtifactsExist(
     return true;
 }
 
+fn isUsableNeoForgeInstallerVersionProfile(profile: json.Value) bool {
+    if (profile != .object) return false;
+    const libraries = profile.object.get("libraries") orelse return false;
+    return libraries == .array;
+}
+
 fn readNeoForgeInstallerProfile(
     allocator: std.mem.Allocator,
     io: std.Io,
     installer_path: []const u8,
     neoforge_version: []const u8,
 ) !json.Parsed(json.Value) {
-    const temp_directory_name = try std.fmt.allocPrint(allocator, ".neoforge-installer-profile-{s}", .{neoforge_version});
+    return readNeoForgeInstallerJson(
+        allocator,
+        io,
+        installer_path,
+        neoforge_version,
+        "install_profile.json",
+        "profile",
+    );
+}
+
+fn readNeoForgeInstallerVersionProfile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    installer_path: []const u8,
+    neoforge_version: []const u8,
+) !json.Parsed(json.Value) {
+    const profile = try readNeoForgeInstallerJson(
+        allocator,
+        io,
+        installer_path,
+        neoforge_version,
+        "version.json",
+        "version",
+    );
+    if (!isUsableNeoForgeInstallerVersionProfile(profile.value)) {
+        profile.deinit();
+        return error.InvalidNeoForgeInstallerVersionProfile;
+    }
+    return profile;
+}
+
+fn readNeoForgeInstallerJson(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    installer_path: []const u8,
+    neoforge_version: []const u8,
+    entry_name: []const u8,
+    profile_kind: []const u8,
+) !json.Parsed(json.Value) {
+    const temp_directory_name = try std.fmt.allocPrint(
+        allocator,
+        ".neoforge-installer-{s}-{s}",
+        .{ profile_kind, neoforge_version },
+    );
     defer allocator.free(temp_directory_name);
     const temp_directory = try path.join(allocator, &.{ McDir, temp_directory_name });
     defer allocator.free(temp_directory);
@@ -1603,22 +1844,22 @@ fn readNeoForgeInstallerProfile(
     var reader = installer.reader(io, &zip_buffer);
     var iterator = try std.zip.Iterator.init(&reader);
     var filename_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    var profile_found = false;
+    var file_found = false;
     while (try iterator.next()) |entry| {
-        if (entry.filename_len != "install_profile.json".len) continue;
+        if (entry.filename_len != entry_name.len) continue;
         try reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
         try reader.interface.readSliceAll(filename_buffer[0..entry.filename_len]);
-        if (!std.mem.eql(u8, filename_buffer[0..entry.filename_len], "install_profile.json")) continue;
+        if (!std.mem.eql(u8, filename_buffer[0..entry.filename_len], entry_name)) continue;
         if (entry.uncompressed_size > 16 * 1024 * 1024) return error.NeoForgeInstallerProfileTooLarge;
         const temp_dir = try fs.cwd().openDir(io, temp_directory, .{});
         defer temp_dir.close(io);
         try entry.extract(&reader, .{}, &filename_buffer, temp_dir);
-        profile_found = true;
+        file_found = true;
         break;
     }
-    if (!profile_found) return error.NeoForgeInstallerProfileNotFound;
+    if (!file_found) return error.NeoForgeInstallerProfileNotFound;
 
-    const profile_path = try path.join(allocator, &.{ temp_directory, "install_profile.json" });
+    const profile_path = try path.join(allocator, &.{ temp_directory, entry_name });
     defer allocator.free(profile_path);
     const profile_text = try fs.cwd().readFileAlloc(io, profile_path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(profile_text);
@@ -1636,15 +1877,11 @@ fn installNeoForge(
     defer allocator.free(installer_name);
     const installer_path = try path.join(allocator, &.{ McDir, installer_name });
     defer allocator.free(installer_path);
-    const installer_relative_path = try std.fmt.allocPrint(
-        allocator,
-        "net/neoforged/neoforge/{s}/neoforge-{s}-installer.jar",
-        .{ neoforge_version, neoforge_version },
-    );
+    const installer_relative_path = try neoForgeInstallerRelativePath(allocator, minecraft_version, neoforge_version);
     defer allocator.free(installer_relative_path);
     const installer_url = try neoForgeArtifactUrl(allocator, maven_base_url, installer_relative_path);
     defer allocator.free(installer_url);
-    const profile_id = try std.fmt.allocPrint(allocator, "neoforge-{s}", .{neoforge_version});
+    const profile_id = try neoForgeProfileId(allocator, minecraft_version, neoforge_version);
     defer allocator.free(profile_id);
     const profile_filename = try std.fmt.allocPrint(allocator, "{s}.json", .{profile_id});
     defer allocator.free(profile_filename);
@@ -1669,6 +1906,11 @@ fn installNeoForge(
     } else |_| {}
 
     try downloadNeoForgeInstaller(allocator, io, installer_url, installer_path);
+
+    std.debug.print("预下载 NeoForge 客户端运行依赖...\n", .{});
+    var version_profile = try readNeoForgeInstallerVersionProfile(allocator, io, installer_path, neoforge_version);
+    defer version_profile.deinit();
+    try downloadLibraries(allocator, io, version_profile.value, maven_base_url);
 
     std.debug.print("下载 NeoForge 安装器处理器依赖...\n", .{});
     var installer_profile = try readNeoForgeInstallerProfile(allocator, io, installer_path, neoforge_version);
@@ -1834,7 +2076,7 @@ fn downloadNeoForgeInstaller(
     try fs.cwd().rename(partial_path, fs.cwd(), installer_path, io);
 }
 
-fn forgeArtifactsExist(
+fn forgeClientArtifactExists(
     allocator: std.mem.Allocator,
     io: std.Io,
     minecraft_version: []const u8,
@@ -1845,29 +2087,25 @@ fn forgeArtifactsExist(
     defer allocator.free(profile_id);
     if (!isUsableForgeProfile(profile, profile_id)) return false;
 
-    const forge_coordinate = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ minecraft_version, forge_version });
-    defer allocator.free(forge_coordinate);
-    const forge_library_prefix = try std.fmt.allocPrint(allocator, "net.minecraftforge:forge:{s}:", .{forge_coordinate});
-    defer allocator.free(forge_library_prefix);
-    var forge_artifact_found = false;
-    const libraries = profile.object.get("libraries").?.array;
-    for (libraries.items) |library| {
-        if (library != .object) return false;
-        const name = library.object.get("name") orelse return false;
-        if (name != .string) return false;
-        const downloads = library.object.get("downloads") orelse continue;
-        if (downloads != .object) return false;
-        const artifact = downloads.object.get("artifact") orelse continue;
-        if (artifact != .object) return false;
-        const relative_path_value = artifact.object.get("path") orelse return false;
-        if (relative_path_value != .string or !isSafeModrinthPackPath(relative_path_value.string)) return false;
-        if (std.mem.startsWith(u8, name.string, forge_library_prefix)) forge_artifact_found = true;
+    const client_jar_path = try forgeClientArtifactPath(allocator, minecraft_version, forge_version);
+    defer allocator.free(client_jar_path);
+    return try isZipFile(io, client_jar_path);
+}
 
-        const local_path = try path.join(allocator, &.{ McDir, "libraries", relative_path_value.string });
-        defer allocator.free(local_path);
-        fs.cwd().access(io, local_path, .{}) catch return false;
+fn forgeClientArtifactPath(allocator: std.mem.Allocator, minecraft_version: []const u8, forge_version: []const u8) ![]u8 {
+    const coordinate = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ minecraft_version, forge_version });
+    defer allocator.free(coordinate);
+    const filename = try std.fmt.allocPrint(allocator, "forge-{s}-client.jar", .{coordinate});
+    defer allocator.free(filename);
+    return try path.join(allocator, &.{ McDir, "libraries", "net", "minecraftforge", "forge", coordinate, filename });
+}
+
+fn forgeInstallerUrl(allocator: std.mem.Allocator, artifact_path: []const u8) ![]u8 {
+    if (std.mem.indexOfAny(u8, artifact_path, "\\:?*\"<>|")) |_| return error.InvalidForgeArtifactPath;
+    if (std.mem.startsWith(u8, artifact_path, "/") or std.mem.indexOf(u8, artifact_path, "..") != null) {
+        return error.InvalidForgeArtifactPath;
     }
-    return forge_artifact_found;
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ OfficialForgeMavenUrl, artifact_path });
 }
 
 fn ensureForgeLauncherProfile(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -1941,22 +2179,27 @@ fn sha1Matches(data: []const u8, expected_hex: []const u8) bool {
 }
 
 fn verifySha1(io: std.Io, file_path: []const u8, expected_hex: []const u8) !bool {
+    const actual_hex = try sha1FileHex(io, file_path);
+    return expected_hex.len == actual_hex.len and std.ascii.eqlIgnoreCase(&actual_hex, expected_hex);
+}
+
+fn sha1FileHex(io: std.Io, file_path: []const u8) ![Sha1.digest_length * 2]u8 {
     const file = try fs.cwd().openFile(io, file_path, .{});
     defer file.close(io);
 
     var hasher = Sha1.init(.{});
-    var buffer: [8192]u8 = undefined;
-    var file_reader = file.reader(io, &buffer);
+    var reader_buffer: [8192]u8 = undefined;
+    var chunk: [8192]u8 = undefined;
+    var file_reader = file.reader(io, &reader_buffer);
     while (true) {
-        const bytes_read = try file_reader.interface.readSliceShort(&buffer);
+        const bytes_read = try file_reader.interface.readSliceShort(&chunk);
         if (bytes_read == 0) break;
-        hasher.update(buffer[0..bytes_read]);
+        hasher.update(chunk[0..bytes_read]);
     }
 
     var digest: [Sha1.digest_length]u8 = undefined;
     hasher.final(&digest);
-    const actual_hex = std.fmt.bytesToHex(digest, .lower);
-    return expected_hex.len == actual_hex.len and std.ascii.eqlIgnoreCase(&actual_hex, expected_hex);
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn queueDownload(
@@ -2402,7 +2645,12 @@ fn downloadClientJar(allocator: std.mem.Allocator, io: std.Io, version_id: []con
         }
 
         if (!try verifySha1(io, temp_path, sha1)) {
-            std.debug.print("  Client JAR SHA-1 不匹配（第 {}/3 次），删除临时文件后重试。\n", .{attempt + 1});
+            const actual_sha1 = try sha1FileHex(io, temp_path);
+            std.debug.print("  Client JAR SHA-1 不匹配（第 {}/3 次，期望 {s}，实际 {s}），删除临时文件后重试。\n", .{
+                attempt + 1,
+                sha1,
+                &actual_sha1,
+            });
             fs.cwd().deleteFile(io, temp_path) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => return err,
@@ -2421,7 +2669,68 @@ fn downloadClientJar(allocator: std.mem.Allocator, io: std.Io, version_id: []con
     return error.ClientJarDownloadFailed;
 }
 
-fn launchGame(allocator: std.mem.Allocator, io: std.Io, version_id: []const u8, instance_dir: []const u8, player_name: []const u8, player_uuid: []const u8, version_json: json.Value, forge_json: ?json.Value) !void {
+fn parseJavaMajorVersion(output: []const u8) ?u32 {
+    const first_quote = std.mem.indexOfScalar(u8, output, '"') orelse return null;
+    const version_start = first_quote + 1;
+    const version_end = std.mem.indexOfScalarPos(u8, output, version_start, '"') orelse return null;
+    const version = output[version_start..version_end];
+    const major_text = if (std.mem.startsWith(u8, version, "1.")) blk: {
+        const legacy_start = "1.".len;
+        const legacy_end = std.mem.indexOfScalarPos(u8, version, legacy_start, '.') orelse version.len;
+        break :blk version[legacy_start..legacy_end];
+    } else blk: {
+        const major_end = std.mem.indexOfAny(u8, version, ".-_+") orelse version.len;
+        break :blk version[0..major_end];
+    };
+    if (major_text.len == 0) return null;
+    return std.fmt.parseInt(u32, major_text, 10) catch null;
+}
+
+fn detectJavaMajorVersion(allocator: std.mem.Allocator, io: std.Io, java_executable: []const u8) !u32 {
+    const argv = [_][]const u8{ java_executable, "-version" };
+    const result = try process.run(allocator, io, .{
+        .argv = &argv,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("无法检查 Java 版本（退出码 {}）：{s}{s}\n", .{ code, result.stdout, result.stderr });
+            return error.JavaVersionCheckFailed;
+        },
+        else => {
+            std.debug.print("检查 Java 版本的进程异常：{s}{s}\n", .{ result.stdout, result.stderr });
+            return error.JavaVersionCheckFailed;
+        },
+    }
+    return parseJavaMajorVersion(result.stderr) orelse
+        parseJavaMajorVersion(result.stdout) orelse error.JavaVersionParseFailed;
+}
+
+fn launchGame(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    version_id: []const u8,
+    instance_dir: []const u8,
+    player_name: []const u8,
+    player_uuid: []const u8,
+    version_json: json.Value,
+    forge_json: ?json.Value,
+    java_executable: []const u8,
+) !void {
+    if (forge_json != null and std.mem.eql(u8, version_id, "1.20.1")) {
+        const java_major = try detectJavaMajorVersion(allocator, io, java_executable);
+        if (java_major < 17 or java_major > 20) {
+            std.debug.print(
+                "Minecraft 1.20.1 的 Forge/NeoForge 不兼容 Java {}（其 ASM 版本不支持该 Java）。请安装 Java 17，并设置 MC_JAVA_HOME 为 Java 17 安装目录。\n",
+                .{java_major},
+            );
+            return error.IncompatibleJavaVersion;
+        }
+    }
+
     // 1. 构建 Classpath
     var cp: std.ArrayList(u8) = .empty;
     defer cp.deinit(allocator);
@@ -2466,7 +2775,7 @@ fn launchGame(allocator: std.mem.Allocator, io: std.Io, version_id: []const u8, 
         owned_argv_args.deinit(allocator);
     }
 
-    try argv.append(allocator, "java");
+    try argv.append(allocator, java_executable);
     if (jvm_args) |args| {
         // Forge's ignoreList uses version_name + ".jar" to exclude the inherited vanilla client jar.
         const jvm_version_name = if (forge_json != null)
@@ -2655,6 +2964,31 @@ test "asset SHA-1 validation rejects corrupt downloads" {
     try std.testing.expect(!sha1Matches("abc", "invalid"));
 }
 
+test "streaming file SHA-1 matches data larger than the reader buffer" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const data = try allocator.alloc(u8, 8192 * 2 + 37);
+    defer allocator.free(data);
+    for (data, 0..) |*byte, index| byte.* = @intCast(index % 251);
+
+    const file = try temp_dir.dir.createFile(io, "sha1-test", .{});
+    var write_buffer: [4096]u8 = undefined;
+    var writer = file.writer(io, &write_buffer);
+    try writer.interface.writeAll(data);
+    try writer.interface.flush();
+    file.close(io);
+
+    var digest: [Sha1.digest_length]u8 = undefined;
+    Sha1.hash(data, &digest, .{});
+    const expected_hex = std.fmt.bytesToHex(digest, .lower);
+    const file_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/sha1-test", .{&temp_dir.sub_path});
+    defer allocator.free(file_path);
+    try std.testing.expect(try verifySha1(io, file_path, &expected_hex));
+}
+
 test "Forge version argument rejects path characters" {
     try std.testing.expect(isValidForgeVersion("47.4.10"));
     try std.testing.expect(!isValidForgeVersion("../installer"));
@@ -2682,20 +3016,30 @@ test "mod management accepts Forge, NeoForge, Fabric instances and safe jar name
     try std.testing.expect(!isValidModFileName("example.zip"));
 }
 
-test "NeoForge supports Minecraft 1.20.1 and newer" {
+test "NeoForge supports all release trains from Minecraft 1.20.1 onward" {
     try std.testing.expect(!isNeoForgeMinecraftSupported("1.20"));
     try std.testing.expect(!isNeoForgeMinecraftSupported("1.20.0"));
     try std.testing.expect(isNeoForgeMinecraftSupported("1.20.1"));
+    try std.testing.expect(isNeoForgeMinecraftSupported("1.20.2"));
+    try std.testing.expect(isNeoForgeMinecraftSupported("1.20.4"));
     try std.testing.expect(isNeoForgeMinecraftSupported("1.21"));
     try std.testing.expect(isNeoForgeMinecraftSupported("1.21.1"));
+    try std.testing.expect(isNeoForgeMinecraftSupported("1.21.11"));
+    try std.testing.expect(isNeoForgeMinecraftSupported("26.1"));
+    try std.testing.expect(isNeoForgeMinecraftSupported("26.3"));
+    try std.testing.expect(!isNeoForgeMinecraftSupported("1.21.1.1"));
     try std.testing.expect(!isNeoForgeMinecraftSupported("invalid"));
 }
 
 test "NeoForge Maven versions are selected for their Minecraft version" {
     const xml =
         \\<metadata><versioning><versions>
+        \\<version>20.2.0</version>
+        \\<version>20.4.1</version>
         \\<version>20.4.237</version>
         \\<version>21.1.172</version>
+        \\<version>21.11.0</version>
+        \\<version>26.1.0.1</version>
         \\<version>1.20.1-47.1.106</version>
         \\</versions></versioning></metadata>
     ;
@@ -2707,10 +3051,56 @@ test "NeoForge Maven versions are selected for their Minecraft version" {
     defer std.testing.allocator.free(legacy_1201);
     try std.testing.expectEqualStrings("1.20.1-47.1.106", legacy_1201);
 
+    const mc_1202 = try selectNeoForgeVersion(std.testing.allocator, xml, "1.20.2");
+    defer std.testing.allocator.free(mc_1202);
+    try std.testing.expectEqualStrings("20.2.0", mc_1202);
+
+    const mc_12111 = try selectNeoForgeVersion(std.testing.allocator, xml, "1.21.11");
+    defer std.testing.allocator.free(mc_12111);
+    try std.testing.expectEqualStrings("21.11.0", mc_12111);
+
+    const mc_261 = try selectNeoForgeVersion(std.testing.allocator, xml, "26.1");
+    defer std.testing.allocator.free(mc_261);
+    try std.testing.expectEqualStrings("26.1.0.1", mc_261);
+
     try std.testing.expectError(
         error.NeoForgeVersionNotFound,
         selectNeoForgeVersion(std.testing.allocator, xml, "1.19.4"),
     );
+}
+
+test "NeoForge 1.20.1 uses its legacy Forge Maven coordinates" {
+    const allocator = std.testing.allocator;
+    const metadata_path = try neoForgeMavenMetadataPath(allocator, "1.20.1");
+    defer allocator.free(metadata_path);
+    try std.testing.expectEqualStrings("net/neoforged/forge/maven-metadata.xml", metadata_path);
+
+    const installer_path = try neoForgeInstallerRelativePath(allocator, "1.20.1", "1.20.1-47.1.106");
+    defer allocator.free(installer_path);
+    try std.testing.expectEqualStrings(
+        "net/neoforged/forge/1.20.1-47.1.106/forge-1.20.1-47.1.106-installer.jar",
+        installer_path,
+    );
+
+    const current_metadata_path = try neoForgeMavenMetadataPath(allocator, "1.21.1");
+    defer allocator.free(current_metadata_path);
+    try std.testing.expectEqualStrings("net/neoforged/neoforge/maven-metadata.xml", current_metadata_path);
+
+    const current_installer_path = try neoForgeInstallerRelativePath(allocator, "1.21.1", "21.1.172");
+    defer allocator.free(current_installer_path);
+    try std.testing.expectEqualStrings(
+        "net/neoforged/neoforge/21.1.172/neoforge-21.1.172-installer.jar",
+        current_installer_path,
+    );
+}
+
+test "NeoForge versions must match the selected Minecraft version" {
+    try std.testing.expect(neoForgeVersionMatchesMinecraft("20.4.237", "1.20.4"));
+    try std.testing.expect(neoForgeVersionMatchesMinecraft("21.1.172", "1.21.1"));
+    try std.testing.expect(neoForgeVersionMatchesMinecraft("21.11.0", "1.21.11"));
+    try std.testing.expect(neoForgeVersionMatchesMinecraft("26.1.0.1", "26.1"));
+    try std.testing.expect(!neoForgeVersionMatchesMinecraft("21.10.0", "1.21.1"));
+    try std.testing.expect(!neoForgeVersionMatchesMinecraft("21.1.172", "1.21.11"));
 }
 
 test "NeoForge profiles are accepted only with required launch metadata" {
@@ -2723,6 +3113,54 @@ test "NeoForge profiles are accepted only with required launch metadata" {
     defer parsed.deinit();
     try std.testing.expect(isUsableNeoForgeProfile(parsed.value, "neoforge-21.1.172"));
     try std.testing.expect(!isUsableNeoForgeProfile(parsed.value, "neoforge-21.1.173"));
+}
+
+test "NeoForge installer version profiles expose runtime libraries" {
+    const parsed = try json.parseFromSlice(
+        json.Value,
+        std.testing.allocator,
+        "{\"id\":\"1.20.1-forge-47.1.106\",\"libraries\":[]}",
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expect(isUsableNeoForgeInstallerVersionProfile(parsed.value));
+
+    const incomplete = try json.parseFromSlice(
+        json.Value,
+        std.testing.allocator,
+        "{\"id\":\"1.20.1-forge-47.1.106\"}",
+        .{},
+    );
+    defer incomplete.deinit();
+    try std.testing.expect(!isUsableNeoForgeInstallerVersionProfile(incomplete.value));
+}
+
+test "Java version parser supports legacy and modern version strings" {
+    try std.testing.expectEqual(@as(?u32, 25), parseJavaMajorVersion("java version \"25.0.4.1\" 2026-07-21"));
+    try std.testing.expectEqual(@as(?u32, 17), parseJavaMajorVersion("openjdk version \"17.0.15\" 2025-04-15"));
+    try std.testing.expectEqual(@as(?u32, 8), parseJavaMajorVersion("java version \"1.8.0_452\""));
+    try std.testing.expect(parseJavaMajorVersion("java version unknown") == null);
+}
+
+test "NeoForge 1.20.1 uses the legacy Forge launcher profile and client artifact paths" {
+    const allocator = std.testing.allocator;
+    const legacy_profile_id = try neoForgeProfileId(allocator, "1.20.1", "1.20.1-47.1.106");
+    defer allocator.free(legacy_profile_id);
+    try std.testing.expectEqualStrings("1.20.1-forge-47.1.106", legacy_profile_id);
+
+    const client_jar_path = try neoForgeClientArtifactPath(allocator, "1.20.1", "1.20.1-47.1.106");
+    defer allocator.free(client_jar_path);
+    const expected_path = try std.fmt.allocPrint(
+        allocator,
+        ".minecraft{c}libraries{c}net{c}neoforged{c}forge{c}1.20.1-47.1.106{c}forge-1.20.1-47.1.106-client.jar",
+        .{ path.sep, path.sep, path.sep, path.sep, path.sep, path.sep },
+    );
+    defer allocator.free(expected_path);
+    try std.testing.expectEqualStrings(expected_path, client_jar_path);
+
+    const current_profile_id = try neoForgeProfileId(allocator, "1.21.1", "21.1.172");
+    defer allocator.free(current_profile_id);
+    try std.testing.expectEqualStrings("neoforge-21.1.172", current_profile_id);
 }
 
 test "Forge profiles accept bootstrap profiles with launch metadata and libraries" {
@@ -2928,6 +3366,39 @@ test "Forge Maven coordinates map to library jar paths" {
     const expected_classified = try std.fmt.allocPrint(std.testing.allocator, "org{c}example{c}sample{c}1.0{c}sample-1.0-natives-windows.jar", .{ path.sep, path.sep, path.sep, path.sep });
     defer std.testing.allocator.free(expected_classified);
     try std.testing.expectEqualStrings(expected_classified, classified);
+}
+
+test "Forge client artifact path uses the installer's generated jar" {
+    const client_jar_path = try forgeClientArtifactPath(
+        std.testing.allocator,
+        "1.20.1",
+        "47.4.28",
+    );
+    defer std.testing.allocator.free(client_jar_path);
+    const expected_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".minecraft{c}libraries{c}net{c}minecraftforge{c}forge{c}1.20.1-47.4.28{c}forge-1.20.1-47.4.28-client.jar",
+        .{ path.sep, path.sep, path.sep, path.sep, path.sep, path.sep },
+    );
+    defer std.testing.allocator.free(expected_path);
+    try std.testing.expectEqualStrings(expected_path, client_jar_path);
+}
+
+test "Forge installer URLs use the official Maven source" {
+    const allocator = std.testing.allocator;
+    const installer_url = try forgeInstallerUrl(
+        allocator,
+        "net/minecraftforge/forge/1.20.1-47.4.10/forge-1.20.1-47.4.10-installer.jar",
+    );
+    defer allocator.free(installer_url);
+    try std.testing.expectEqualStrings(
+        "https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.4.10/forge-1.20.1-47.4.10-installer.jar",
+        installer_url,
+    );
+    try std.testing.expectError(
+        error.InvalidForgeArtifactPath,
+        forgeInstallerUrl(allocator, "../installer.jar"),
+    );
 }
 
 test "Forge launch arguments retain required vanilla arguments" {
@@ -3231,4 +3702,20 @@ test "Modrinth SHA-1 values must be 40 hexadecimal characters" {
     try std.testing.expect(isValidSha1Hex("3D1BC31982EFF30195E3A58247774B5136459E8D"));
     try std.testing.expect(!isValidSha1Hex("not-a-hash"));
     try std.testing.expect(!isValidSha1Hex("3d1bc31982eff30195e3a58247774b5136459e8x"));
+}
+
+test "missing Minecraft release suggests matching preview version IDs" {
+    const parsed = try json.parseFromSlice(
+        json.Value,
+        std.testing.allocator,
+        "[{\"id\":\"26.4-snapshot-5\"},{\"id\":\"26.4-pre-1\"},{\"id\":\"26.3\"},{\"id\":\"26.40-snapshot-1\"}]",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const versions = parsed.value.array.items;
+    try std.testing.expectEqualStrings("26.4-snapshot-5", findPreviewVersionId(versions, "26.4").?);
+    try std.testing.expect(findPreviewVersionId(versions, "26.4-snapshot-5") == null);
+    try std.testing.expect(findPreviewVersionId(versions[3..], "26.4") == null);
+    try std.testing.expect(findPreviewVersionId(versions, "26.5") == null);
 }
