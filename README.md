@@ -15,12 +15,18 @@
 | 加载器 | 支持范围 |
 | --- | --- |
 | Forge | Minecraft 1.13 及以上，限 Forge 官方发布的版本 |
-| NeoForge | Minecraft 1.20.1 及以上 |
+| NeoForge | Minecraft 1.20.1 及以上的正式版本；按官方 Maven 元数据匹配可用版本，包含 1.20.x、1.21.x 及后续版本号格式 |
 | Fabric | Fabric Loader 官方元数据提供的 Minecraft 版本 |
 
 ## 环境要求
 
-- **运行**：可用的 Java 运行时，且 `java` 命令可从 `PATH` 找到。所需 Java 版本取决于 Minecraft 及加载器版本。
+- **运行**：可用的 Java 运行时和 `curl`，两者都需要能从 `PATH` 找到。所需 Java 版本取决于 Minecraft 及加载器版本；`curl` 用于下载游戏文件和元数据。在 Debian 13 上可运行 `sudo apt install curl` 安装。
+- **Java 选择**：可设置 `MC_JAVA_HOME` 指定启动 Minecraft 使用的 Java 安装目录；未设置时使用 `JAVA_HOME`，两者都未设置则使用 `PATH` 中的 `java`。Minecraft 1.20.1 的 Forge/NeoForge 建议使用 Java 17；启动器会拒绝 Java 17 以下或 Java 20 以上的运行时。例如：
+
+```powershell
+$env:MC_JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-17"
+.\zig-out\bin\zig-mc.exe 1.20.1 Steve --neoforge
+```
 - **安装或导入游戏**：需要互联网连接。
 - **从源码构建**：Zig 0.16.0。
 
@@ -100,7 +106,27 @@ zig test src\main.zig
 .\zig-out\bin\zig-mc.exe --delete-mod <加载器实例ID> <mod文件名.jar>
 ```
 
-不带参数运行程序可查看命令帮助。NeoForge 资源下载也可通过 `NEOFORGED_MAVEN_URL` 环境变量配置 Maven 镜像地址。
+不带参数运行程序可查看命令帮助。Forge 安装器从 Forge 官方 Maven 源下载。NeoForge 资源下载可通过 `NEOFORGED_MAVEN_URL` 配置 Maven 镜像地址。Windows 上若 curl 明确报告证书吊销服务器脱机，程序会使用 Schannel 的 `--ssl-no-revoke` 选项重试；此选项仅跳过吊销状态检查，不会关闭 TLS 证书验证。
+
+旧版曾使用 `FORGE_MAVEN_URL` 配置 Forge 镜像；新版已不再读取此变量。如需删除当前 PowerShell 会话中的变量：
+
+```powershell
+Remove-Item Env:FORGE_MAVEN_URL -ErrorAction SilentlyContinue
+```
+
+如需永久删除当前用户的变量：
+
+```powershell
+[Environment]::SetEnvironmentVariable("FORGE_MAVEN_URL", $null, "User")
+```
+
+如果它是系统变量，请以管理员身份打开 PowerShell 并执行：
+
+```powershell
+[Environment]::SetEnvironmentVariable("FORGE_MAVEN_URL", $null, "Machine")
+```
+
+删除后重新打开终端和启动器，使更改生效。
 
 ## GitHub 工程
 
